@@ -31,6 +31,8 @@ enum algorithms{
   RESOURCE_BASED
 };
 
+int recent_serv_id;
+
 enum direction{
 	CLNT2SERV,
 	SERV2CLNT
@@ -117,8 +119,9 @@ int add_server_info(int sock, struct in_addr ip, int port)
       serv_list[i].ip = ip;
       serv_list[i].port = port;
       serv_list[i].clnt_cnt = 0;
+			printf("New Server[ID:%d, Sock:%d] is added\n",i,serv_list[i].sock);
+   	  break;
     }
-    break;
   }
   serv_cnt++;
   return 0;
@@ -166,24 +169,41 @@ void make_pseudo_header(void* temp_c, uint32_t saddr, uint32_t daddr, uint8_t pr
 }
 
 int check_ip_and_port(char *buffer, struct sockaddr_in lbaddr){
-  ssize_t received;
-	struct iphdr *synack_ip = (struct iphdr *)buffer;
-	struct tcphdr *synack_tcp = (struct tcphdr *)(buffer+sizeof(struct iphdr));	
-  if(synack_ip->daddr==lbaddr.sin_addr.s_addr && synack_tcp->dest==lbaddr.sin_port){
+	struct iphdr *ip = (struct iphdr *)buffer;
+	struct tcphdr *tcp = (struct tcphdr *)(buffer+sizeof(struct iphdr));	
+  if(ip->daddr==lbaddr.sin_addr.s_addr && tcp->dest==lbaddr.sin_port){
 		debug(
-	  printf("SYN-ACK length: %d\n",received);
-	  printf("SYN: %d\n",synack_tcp->syn);
-	  printf("ACK: %d\n",synack_tcp->ack);
-		printf("FIN: %d\n",synack_tcp->fin);
-	  printf("SEQ_num: %u\n",ntohl(synack_tcp->seq));
-	  printf("ACK_num: %u\n",ntohl(synack_tcp->ack_seq));
+			printf("Src Port: %d\n",ntohs(tcp->source));
+			printf("Dest Port: %d\n",ntohs(tcp->dest));
+			printf("SYN: %d\n",tcp->syn);
+			printf("ACK: %d\n",tcp->ack);
+			printf("FIN: %d\n",tcp->fin);
+			printf("SEQ_num: %u\n",ntohl(tcp->seq));
+			printf("ACK_num: %u\n",ntohl(tcp->ack_seq));
 		)
-    return 0;
+    return CLNT2SERV;
   }
-  else return 1;
+	else if(ip->daddr==lbaddr.sin_addr.s_addr){
+		for(int i=0;i<MAX_CLNT_CNT;i++){
+			if(clnt_list[i].pseudo_port==tcp->dest){
+				debug(
+					printf("Src Port: %d\n",ntohs(tcp->source));
+					printf("Dest Port: %d\n",ntohs(tcp->dest));
+					printf("SYN: %d\n",tcp->syn);
+					printf("ACK: %d\n",tcp->ack);
+					printf("FIN: %d\n",tcp->fin);
+					printf("SEQ_num: %u\n",ntohl(tcp->seq));
+					printf("ACK_num: %u\n",ntohl(tcp->ack_seq));
+				)
+				return SERV2CLNT;
+			}
+		}
+		return -1;
+	}
+  else return -1;
 }
 
-char *nat(char *buffer, int dest_id, struct sockaddr_in lbaddr, enum direction dir){
+char *nat(char *buffer, int source_id, int dest_id, struct sockaddr_in lbaddr, enum direction dir){
   struct iphdr *ip = (struct iphdr *)buffer;
 	struct tcphdr *tcp = (struct tcphdr *)(buffer+sizeof(struct iphdr));	
 	int packet_len = ntohs(ip->tot_len);
@@ -198,14 +218,15 @@ char *nat(char *buffer, int dest_id, struct sockaddr_in lbaddr, enum direction d
 	);
 
 	ip->saddr = lbaddr.sin_addr.s_addr;
-	tcp->source = lbaddr.sin_port;
 	if(dir == CLNT2SERV){
 		ip->daddr = serv_list[dest_id].ip.s_addr;
   	tcp->dest = serv_list[dest_id].port;
+		tcp->source = clnt_list[source_id].pseudo_port;
 	}
 	else{
 		ip->daddr = clnt_list[dest_id].ip.s_addr;
   	tcp->dest = clnt_list[dest_id].port;
+		tcp->source = lbaddr.sin_port;
 	}
   
 
@@ -249,6 +270,26 @@ void add_new_clnt(clnt_list_node *clnt_node, char *buffer){
 
 // TODO select server
 int select_serv(int algo){
+	switch(algo){
+		case RR:
+			if(recent_serv_id == -1){
+				for(int i=0;i<MAX_SERV_CNT;i++){
+					if(serv_list[i].sock != 0){
+						recent_serv_id = i;
+						return i;
+					}
+				}
+			}
+			else{
+				while(1){
+					recent_serv_id++;
+					if(recent_serv_id==MAX_SERV_CNT) recent_serv_id=0;
+					if(serv_list[recent_serv_id].sock != 0){
+						return recent_serv_id;
+					}
+				}
+			}
+	}
 	return 0;
 }
 
@@ -299,6 +340,8 @@ int main(int argc, char *argv[]){
   for(int i=0;i<MAX_SERV_CNT;i++){
     memset(serv_list,0,sizeof(serv_list_node));
   }
+
+	
 
   // Open Raw Socket
   int raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
@@ -372,7 +415,7 @@ int main(int argc, char *argv[]){
           recv(serv_sock,&server_port,sizeof(u_short),0);
           printf("server_port: %d\n",server_port);
           add_server_info(serv_sock,serv_adr.sin_addr,htons(server_port));
-          printf("Connected Server: %d [%s:%d]\nServer count: %d\n", serv_sock,inet_ntoa(*(struct in_addr *)&(serv_adr.sin_addr)),ntohs(serv_adr.sin_port),serv_cnt);
+          debug(printf("Connected Server: %d [%s:%d]\nServer count: %d\n", serv_sock,inet_ntoa(*(struct in_addr *)&(serv_adr.sin_addr)),ntohs(serv_adr.sin_port),serv_cnt);)
 
           setnonblockingmode(serv_sock);
           event.events=EPOLLIN|EPOLLET;
@@ -381,40 +424,60 @@ int main(int argc, char *argv[]){
         }
       }
 			else if(ep_events[i].data.fd==raw_sock){
-				int source_id, dest_id;
+				int source_id = -1;
+				int dest_id;
 				int received = recv(raw_sock,buf,BUF_SIZE,0);
-				int block = check_ip_and_port(buf, lbaddr);
+				enum direction dir = check_ip_and_port(buf, lbaddr);
+				struct iphdr *ip = (struct iphdr *)buf;
+				struct tcphdr *tcp = (struct tcphdr *)(buf+sizeof(struct iphdr));	
 				char *new_packet = NULL;
-				if(block == 1 || serv_cnt == 0) continue;
+				if(dir == -1 || serv_cnt == 0) continue;
 				TCP_TYPE type = check_type(buf);
-				switch(type){
-					case SYN:
+				if(dir==CLNT2SERV){
+					if(clnt_cnt == MAX_CLNT_CNT) continue;
+					for(int i=0;i<MAX_CLNT_CNT;i++){
+						if(clnt_list[i].port==tcp->source){
+							source_id = i;
+							break;
+						}
+					}
+					// There is no information about source in may be SYN
+					if(source_id<0){
+						if(type!=SYN) continue;
 						// Update client list and forwarding table
-						if(clnt_cnt == MAX_CLNT_CNT) continue;
 						for(int i=0;i<MAX_CLNT_CNT;i++){
 							if(clnt_list[i].port == 0){
 								source_id = i;
 								add_new_clnt(&clnt_list[source_id],buf);
 								forwarding_table[source_id] = select_serv(selected_algo);
-								dest_id = forwarding_table[source_id];
-								printf("--------NAT--------\n");
-								new_packet = nat(buf,dest_id,lbaddr,CLNT2SERV);
-								printf("-------------------\n");
-								sendto(raw_sock, new_packet, received, 0, &(serv_list[dest_id].sock_adr), sizeof(struct sockaddr));
+								printf("New Client[ID:%d] is connected to Server[ID:%d]\n",source_id,forwarding_table[source_id]);
 								break;
 							}
 						}
-						break;
-					case SYN_ACK:
-
-						// for(int i=0;i<MAX_CLNT_CNT;i++){
-						// 	if(forwardig_table[i].
-						// }
-						break;
-					case ACK:
-						break;
-					case FIN:
-						break;
+					}
+					dest_id = forwarding_table[source_id];
+					debug(printf("--------NAT--------\n");)
+					new_packet = nat(buf,source_id,dest_id,lbaddr,dir);
+					debug(printf("-------------------\n");)
+					sendto(raw_sock, new_packet, received, 0, &(serv_list[dest_id].sock_adr), sizeof(struct sockaddr));
+				}
+				else if(dir == SERV2CLNT){
+					for(int i=0;i<MAX_CLNT_CNT;i++){
+						if(clnt_list[i].pseudo_port==tcp->dest){
+							dest_id = i;
+							source_id = forwarding_table[i];
+							break;
+						}
+					}
+					debug(printf("--------NAT--------\n");)
+					new_packet = nat(buf,source_id,dest_id,lbaddr,dir);
+					debug(printf("-------------------\n");)
+					struct sockaddr_in daddr;
+					daddr.sin_family = AF_INET;
+					daddr.sin_port = tcp->dest;
+					daddr.sin_addr.s_addr = ip->daddr;
+					sendto(raw_sock, new_packet, received, 0, (struct sockaddr *)&daddr, sizeof(struct sockaddr_in));
+					break;
 				}
 			}
       else{
