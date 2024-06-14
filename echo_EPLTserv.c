@@ -56,6 +56,9 @@ int main(int argc, char *argv[])
 		}
 		else{
 			printf("Connected to Load Balancer: %d\n",lb_algorithm);
+			u_short port_for_client = (u_short)(atoi(argv[3]));
+			printf("port_for_client: %d\n",port_for_client);
+			send(lb_sock,&port_for_client,sizeof(u_short),0);
 		}
 	}
 
