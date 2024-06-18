@@ -10,6 +10,7 @@
 #include <sys/epoll.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <limits.h>
 
 #ifdef DEBUG
   #define debug(fn) fn
@@ -44,7 +45,7 @@ typedef struct _serv_list_node{
   u_short port;
   int clnt_cnt;
 	struct sockaddr sock_adr;
-	float resource_usage; // cpu_usage + ram_usage %
+	int resource_usage; // cpu_usage + ram_usage %
 }serv_list_node;
 
 int serv_cnt;
@@ -58,7 +59,7 @@ typedef struct _clnt_list_node{
 
 clnt_list_node clnt_list[MAX_CLNT_CNT];
 int clnt_cnt;
-int forwarding_table[MAX_CLNT_CNT];
+int forwarding_table[MAX_CLNT_CNT][2];
 
 typedef enum _TCP_TYPE{
 	SYN,
@@ -119,7 +120,7 @@ int add_server_info(int sock, struct in_addr ip, int port)
       serv_list[i].ip = ip;
       serv_list[i].port = port;
       serv_list[i].clnt_cnt = 0;
-			printf("New Server[ID:%d, Sock:%d] is added\n",i,serv_list[i].sock);
+			printf("New Server[ID:%d, Sock:%d, Port:%d] is added(Server Count: %d)\n",i,serv_list[i].sock,ntohs(port),serv_cnt);
    	  break;
     }
   }
@@ -127,14 +128,10 @@ int add_server_info(int sock, struct in_addr ip, int port)
   return 0;
 }
 
-void delete_server_node(int sock){
-  for(int i=0;i<MAX_SERV_CNT;i++){
-    if(serv_list[i].sock == sock){
-      memset(&serv_list[i],0,sizeof(serv_list_node));
-    }
-    break;
-  }
-  serv_cnt--;
+void delete_server_node(int id){
+	serv_cnt--;
+	printf("Server[ID:%d, Sock:%d] is closed(Server Count: %d)\n",id,serv_list[id].sock,serv_cnt);
+	memset(&serv_list[id],0,sizeof(serv_list_node));
 }
 
 // Define checksum function which returns unsigned short value 
@@ -268,7 +265,7 @@ void add_new_clnt(clnt_list_node *clnt_node, char *buffer){
 	clnt_cnt++;
 }
 
-// TODO select server
+
 int select_serv(int algo){
 	switch(algo){
 		case RR:
@@ -289,6 +286,40 @@ int select_serv(int algo){
 					}
 				}
 			}
+			break;
+		case LEAST_CONN:
+			printf("Connection List\n");
+			int min_clnt = MAX_CLNT_CNT;
+			int min_index;
+			int count_down = serv_cnt;
+			for(int i=0;i<MAX_CLNT_CNT;i++){
+				if(serv_list[i].sock != 0){
+					printf("[ID:%d] %d\n",i,serv_list[i].clnt_cnt);
+					count_down--;
+					if(serv_list[i].clnt_cnt < min_clnt){
+						min_clnt = serv_list[i].clnt_cnt;
+						min_index = i;
+					}
+				}
+				if(count_down == 0) break;
+			}
+			return min_index;
+		case RESOURCE_BASED:
+			printf("Resource Usages\n");
+			int min_resource = INT_MAX;
+			count_down = serv_cnt;
+			for(int i=0;i<MAX_CLNT_CNT;i++){
+				if(serv_list[i].sock != 0){
+					printf("[ID:%d] %d\n",i,serv_list[i].resource_usage);
+					count_down--;
+					if(serv_list[i].resource_usage < min_resource){
+						min_resource = serv_list[i].resource_usage;
+						min_index = i;
+					}
+				}
+				if(count_down == 0) break;
+			}
+			return min_index;
 	}
 	return 0;
 }
@@ -322,6 +353,13 @@ int main(int argc, char *argv[]){
 	lb_adr.sin_addr.s_addr=htonl(INADDR_ANY);
 	lb_adr.sin_port=htons(atoi(argv[2]));
 
+	int optval = 1;
+	if (setsockopt(lb_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
+		perror("setsockopt(SO_REUSEADDR)");
+		close(lb_sock);
+		exit(EXIT_FAILURE);
+	}
+
   if(bind(lb_sock, (struct sockaddr*) &lb_adr, sizeof(lb_adr))==-1)
 		error_handling("bind() error");
 	if(listen(lb_sock, 5)==-1)
@@ -340,8 +378,6 @@ int main(int argc, char *argv[]){
   for(int i=0;i<MAX_SERV_CNT;i++){
     memset(serv_list,0,sizeof(serv_list_node));
   }
-
-	
 
   // Open Raw Socket
   int raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
@@ -384,10 +420,9 @@ int main(int argc, char *argv[]){
 
 	// Init Forwarding Table : 서버-클라이언트 연결 리스트(클라이언트,서버)
   for(int i=0;i<MAX_CLNT_CNT;i++){
-    forwarding_table[i] = -1;
+    forwarding_table[i][0] = -1;
+		forwarding_table[i][1] = -1;
   }
-
-	// TODO init_health_check_timer
   
   while(1){
     // Server Epoll Wait
@@ -413,7 +448,6 @@ int main(int argc, char *argv[]){
           // Update Server List
           u_short server_port;
           recv(serv_sock,&server_port,sizeof(u_short),0);
-          printf("server_port: %d\n",server_port);
           add_server_info(serv_sock,serv_adr.sin_addr,htons(server_port));
           debug(printf("Connected Server: %d [%s:%d]\nServer count: %d\n", serv_sock,inet_ntoa(*(struct in_addr *)&(serv_adr.sin_addr)),ntohs(serv_adr.sin_port),serv_cnt);)
 
@@ -434,40 +468,55 @@ int main(int argc, char *argv[]){
 				if(dir == -1 || serv_cnt == 0) continue;
 				TCP_TYPE type = check_type(buf);
 				if(dir==CLNT2SERV){
-					if(clnt_cnt == MAX_CLNT_CNT) continue;
-					for(int i=0;i<MAX_CLNT_CNT;i++){
-						if(clnt_list[i].port==tcp->source){
-							source_id = i;
+					for(int j=0;j<MAX_CLNT_CNT;j++){
+						if(clnt_list[j].port==tcp->source){
+							source_id = j;
 							break;
 						}
 					}
 					// There is no information about source in may be SYN
 					if(source_id<0){
-						if(type!=SYN) continue;
+						if(type!=SYN || clnt_cnt==MAX_CLNT_CNT) continue;
 						// Update client list and forwarding table
-						for(int i=0;i<MAX_CLNT_CNT;i++){
-							if(clnt_list[i].port == 0){
-								source_id = i;
+						for(int j=0;j<MAX_CLNT_CNT;j++){
+							if(clnt_list[j].port == 0){
+								source_id = j;
 								add_new_clnt(&clnt_list[source_id],buf);
-								forwarding_table[source_id] = select_serv(selected_algo);
-								printf("New Client[ID:%d] is connected to Server[ID:%d]\n",source_id,forwarding_table[source_id]);
+								forwarding_table[source_id][0] = select_serv(selected_algo);
+								forwarding_table[source_id][1] = 2;
+								serv_list[forwarding_table[source_id][0]].clnt_cnt++;
+								printf("New Client[ID:%d] is connected to Server[ID:%d]\n",source_id,forwarding_table[source_id][0]);
 								break;
 							}
 						}
 					}
-					dest_id = forwarding_table[source_id];
+					else if(type == FIN){
+						forwarding_table[source_id][1] = 1;
+					}
+					dest_id = forwarding_table[source_id][0];
 					debug(printf("--------NAT--------\n");)
 					new_packet = nat(buf,source_id,dest_id,lbaddr,dir);
 					debug(printf("-------------------\n");)
 					sendto(raw_sock, new_packet, received, 0, &(serv_list[dest_id].sock_adr), sizeof(struct sockaddr));
+					if(type == ACK && forwarding_table[source_id][1]==1){
+						printf("Client[ID:%d] is disconnected from Server[ID:%d]\n",source_id,forwarding_table[source_id][0]);
+						serv_list[dest_id].clnt_cnt--;
+						forwarding_table[source_id][0]==-1;
+						forwarding_table[source_id][1]==-1;
+						memset(&clnt_list[source_id],0,sizeof(clnt_list_node));
+						clnt_cnt--;
+					}
 				}
 				else if(dir == SERV2CLNT){
-					for(int i=0;i<MAX_CLNT_CNT;i++){
-						if(clnt_list[i].pseudo_port==tcp->dest){
-							dest_id = i;
-							source_id = forwarding_table[i];
+					for(int j=0;j<MAX_CLNT_CNT;j++){
+						if(clnt_list[j].pseudo_port==tcp->dest){
+							dest_id = j;
+							source_id = forwarding_table[j][0];
 							break;
 						}
+					}
+					if(type==FIN){
+						forwarding_table[dest_id][1] = 1;
 					}
 					debug(printf("--------NAT--------\n");)
 					new_packet = nat(buf,source_id,dest_id,lbaddr,dir);
@@ -477,25 +526,42 @@ int main(int argc, char *argv[]){
 					daddr.sin_port = tcp->dest;
 					daddr.sin_addr.s_addr = ip->daddr;
 					sendto(raw_sock, new_packet, received, 0, (struct sockaddr *)&daddr, sizeof(struct sockaddr_in));
+					if(type==ACK && forwarding_table[dest_id][1]==-1){
+						printf("Client[ID:%d] is disconnected from Server[ID:%d]\n",dest_id,forwarding_table[dest_id][0]);
+						serv_list[source_id].clnt_cnt--;
+						forwarding_table[dest_id][0]==-1;
+						forwarding_table[dest_id][1]==-1;
+						memset(&clnt_list[dest_id],0,sizeof(clnt_list_node));
+						clnt_cnt--;
+					}
 					break;
 				}
 			}
       else{
+				int server_id, received_usage;
+				for(int j=0;j<MAX_SERV_CNT;j++){
+					if(serv_list[j].sock==ep_events[i].data.fd){
+						server_id = j;
+						break;
+					}
+				}
         while(1){
-					str_len=read(ep_events[i].data.fd, buf, BUF_SIZE);
+					str_len=read(ep_events[i].data.fd, &received_usage, sizeof(int));
 					if(str_len==0){
 						epoll_ctl(epfd, EPOLL_CTL_DEL, ep_events[i].data.fd, NULL);
 						close(ep_events[i].data.fd);
-
             // Delete from Forwarding Table
-            for(int i=0;i<MAX_CLNT_CNT;i++){
-              if(serv_list[forwarding_table[i]].sock == ep_events[i].data.fd){
-                forwarding_table[i] = -1;
-              }
+            for(int j=0;j<MAX_CLNT_CNT;j++){
+              if(forwarding_table[j][0] == server_id){
+								printf("Client[ID:%d] is disconnected from Server[ID:%d]\n",j,forwarding_table[j][0]);
+								memset(&clnt_list[j],0,sizeof(clnt_list_node));
+								clnt_cnt--;
+                forwarding_table[j][0] = -1;
+								forwarding_table[j][1] = -1;
+              } 
             }
             // Update Server List
-            delete_server_node(ep_events[i].data.fd);
-						printf("closed client: %d \nServer count: %d\n", ep_events[i].data.fd,serv_cnt);
+            delete_server_node(server_id);
 						break;
 					}
 					else if(str_len<0){
@@ -503,7 +569,9 @@ int main(int argc, char *argv[]){
 							break;
 					}
 					else{
-						puts("Not yet!");
+						// Health check
+						printf("Received health check form Server[ID:%d]: %d\n",server_id,received_usage);
+						serv_list[server_id].resource_usage = received_usage;
 					}
 				}
       }

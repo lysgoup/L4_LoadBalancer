@@ -6,6 +6,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/sysinfo.h>
+#include <time.h>
 
 #define BUF_SIZE 40
 #define EPOLL_SIZE 50
@@ -16,6 +18,8 @@ enum algorithms{
   RESOURCE_BASED
 };
 
+time_t prev_time, cur_time;
+
 void error_handling(char *buf)
 {
 	fputs(buf, stderr);
@@ -23,11 +27,62 @@ void error_handling(char *buf)
 	exit(1);
 }
 
+double get_cpu_usage() {
+    long double a[4], b[4], loadavg;
+    FILE *fp;
+
+    fp = fopen("/proc/stat", "r");
+    if (!fp) {
+        perror("fopen");
+        exit(EXIT_FAILURE);
+    }
+    fscanf(fp, "%*s %Lf %Lf %Lf %Lf", &a[0], &a[1], &a[2], &a[3]);
+    fclose(fp);
+    sleep(1);
+
+    fp = fopen("/proc/stat", "r");
+    if (!fp) {
+        perror("fopen");
+        exit(EXIT_FAILURE);
+    }
+    fscanf(fp, "%*s %Lf %Lf %Lf %Lf", &b[0], &b[1], &b[2], &b[3]);
+    fclose(fp);
+
+    loadavg = ((b[0] + b[1] + b[2]) - (a[0] + a[1] + a[2])) /
+              ((b[0] + b[1] + b[2] + b[3]) - (a[0] + a[1] + a[2] + a[3]));
+    return loadavg * 100;
+}
+
+long get_ram_usage() {
+    struct sysinfo info;
+    if (sysinfo(&info) != 0) {
+        perror("sysinfo");
+        exit(EXIT_FAILURE);
+    }
+    return info.totalram - info.freeram;
+}
+
+void send_resource_info(int sock){
+	double cpu_usage;
+	long ram_usage;
+	cpu_usage = get_cpu_usage();
+	ram_usage = get_ram_usage() / 1000000;
+
+	printf("CPU Usage: %.2f%%, RAM Usage: %ld Mb\n", cpu_usage, ram_usage);
+
+	int resource_usage = (int)cpu_usage + (int)ram_usage;
+	printf("Send to server: %d\n",resource_usage);
+
+	send(sock,&resource_usage,sizeof(int),0);
+	prev_time = cur_time;
+}
+
 int main(int argc, char *argv[])
 {
 	// Connect to LB
 	int lb_sock;
 	struct sockaddr_in lb_adr;
+	int lb_algorithm;
 
 	if (argc != 4) {
 		printf("Usage : %s <LB_IP> <LB_port> <port>\n", argv[0]);
@@ -47,7 +102,6 @@ int main(int argc, char *argv[])
 		error_handling("connect() error!");
 	}
 	else{
-		int lb_algorithm;
 		int check = recv(lb_sock,&lb_algorithm,sizeof(int),0);
 		if(check == 0){
 			puts("Connection Failed: You may have exceeded the number of servers that can connect to LB.");
@@ -78,6 +132,13 @@ int main(int argc, char *argv[])
 	serv_adr.sin_family=AF_INET;
 	serv_adr.sin_addr.s_addr=htonl(INADDR_ANY);
 	serv_adr.sin_port=htons(atoi(argv[3]));
+
+	int optval = 1;
+	if (setsockopt(serv_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
+		perror("setsockopt(SO_REUSEADDR)");
+		close(serv_sock);
+		exit(EXIT_FAILURE);
+	}
 	
 	if(bind(serv_sock, (struct sockaddr*) &serv_adr, sizeof(serv_adr))==-1)
 		error_handling("bind() error");
@@ -97,7 +158,10 @@ int main(int argc, char *argv[])
 
 	while(1)
 	{
-		event_cnt=epoll_wait(epfd, ep_events, EPOLL_SIZE, -1);
+		time(&cur_time);
+		if(lb_algorithm==RESOURCE_BASED && difftime(cur_time, prev_time) >= 10.0) send_resource_info(lb_sock);
+		event_cnt=epoll_wait(epfd, ep_events, EPOLL_SIZE, 0);
+		if(event_cnt==0) continue;
 		if(event_cnt==-1)
 		{
 			puts("epoll_wait() error");
@@ -111,6 +175,7 @@ int main(int argc, char *argv[])
 			{
 				adr_sz=sizeof(clnt_adr);
 				clnt_sock=accept(serv_sock, (struct sockaddr*)&clnt_adr, &adr_sz);
+				
 				event.events=EPOLLIN;
 				event.data.fd=clnt_sock;
 				epoll_ctl(epfd, EPOLL_CTL_ADD, clnt_sock, &event);

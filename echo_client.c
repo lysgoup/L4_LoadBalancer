@@ -50,6 +50,8 @@ int main(int argc, char *argv[])
 			recv_cnt = read(sock, &message[recv_len], BUF_SIZE-1);
 			if (recv_cnt == -1)
 				error_handling("read() error!");
+			if (recv_cnt == 0)
+				error_handling("Server connection broken!\n");
 			recv_len += recv_cnt;
 		}
 		
