@@ -1,10 +1,10 @@
-all : echo_client.c echo_EPLTserv.c LoadBalancer.c
-	gcc -o lb LoadBalancer.c
-	gcc -o serv echo_EPLTserv.c
-	gcc -o clnt echo_client.c
+all : client/echo_client.c server/echo_EPLTserv.c src/LoadBalancer.c
+	gcc -o lb src/LoadBalancer.c
+	gcc -o serv server/echo_EPLTserv.c
+	gcc -o clnt client/echo_client.c
 
 debug : LoadBalancer.c
-	gcc -o lb LoadBalancer.c -DDEBUG
+	gcc -o lb src/LoadBalancer.c -DDEBUG
 
 clean : 
 	rm lb serv clnt
